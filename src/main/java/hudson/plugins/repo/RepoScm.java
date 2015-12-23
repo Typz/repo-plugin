@@ -27,6 +27,8 @@ import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.IOException;
 import java.io.OutputStream;
+import java.io.PrintStream;
+import java.io.PrintWriter;
 import java.io.Serializable;
 import java.net.URL;
 import java.util.ArrayList;
@@ -34,11 +36,19 @@ import java.util.List;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 
+import com.cloudbees.jenkins.plugins.sshcredentials.SSHUserPrivateKey;
+import com.cloudbees.plugins.credentials.CredentialsMatcher;
+import com.cloudbees.plugins.credentials.CredentialsMatchers;
+import com.cloudbees.plugins.credentials.CredentialsProvider;
+import com.cloudbees.plugins.credentials.common.StandardCredentials;
+import com.cloudbees.plugins.credentials.common.StandardListBoxModel;
+import com.cloudbees.plugins.credentials.domains.URIRequirementBuilder;
 import hudson.EnvVars;
 import hudson.Extension;
 import hudson.FilePath;
 import hudson.Launcher;
 import hudson.Util;
+import hudson.model.Item;
 import hudson.model.Job;
 import hudson.model.ParameterDefinition;
 import hudson.model.ParametersDefinitionProperty;
@@ -50,9 +60,13 @@ import hudson.scm.PollingResult;
 import hudson.scm.SCM;
 import hudson.scm.SCMDescriptor;
 import hudson.scm.SCMRevisionState;
+import hudson.security.ACL;
+import hudson.util.ListBoxModel;
+import hudson.util.Secret;
 import net.sf.json.JSONObject;
 
 import org.apache.commons.lang.StringUtils;
+import org.kohsuke.stapler.AncestorInPath;
 import org.kohsuke.stapler.DataBoundConstructor;
 import org.kohsuke.stapler.DataBoundSetter;
 import org.kohsuke.stapler.QueryParameter;
@@ -97,6 +111,7 @@ public class RepoScm extends SCM implements Serializable {
 	@CheckForNull private boolean trace;
 	@CheckForNull private boolean showAllChanges;
 	@CheckForNull private boolean noTags;
+	@CheckForNull private String credentialsId;
 
 	/**
 	 * Returns the manifest repository URL.
@@ -189,6 +204,7 @@ public class RepoScm extends SCM implements Serializable {
 	/**
 	 * Returns the number of jobs used for sync. By default, this is null and
 	 * repo does not use concurrent jobs.
+
 	 */
 	@Exported
 	public int getJobs() {
@@ -262,6 +278,11 @@ public class RepoScm extends SCM implements Serializable {
 	 */
 	@Exported
 	public boolean isNoTags() { return noTags; }
+	/**
+	 * Returns the value of noTags.
+	 */
+	@Exported
+	public String getCredentialsId() { return credentialsId; }
 
 	/**
 	 * The constructor takes in user parameters and sets them. Each job using
@@ -537,6 +558,17 @@ public class RepoScm extends SCM implements Serializable {
 		this.noTags = noTags;
 	}
 
+	/**
+	 * Set credentials.
+	 *
+	 * @param credentialsId
+	 *            Credentials to use to connect to repository.
+	 */
+	@DataBoundSetter
+	public void setCredentialsId(final String credentialsId) {
+		this.credentialsId = credentialsId;
+	}
+
 	@Override
 	public SCMRevisionState calcRevisionsFromBuild(
 			@Nonnull final Run<?, ?> build, @Nullable final FilePath workspace,
@@ -579,7 +611,7 @@ public class RepoScm extends SCM implements Serializable {
 			repoDir.mkdirs();
 		}
 
-		if (!checkoutCode(launcher, repoDir, env, listener.getLogger())) {
+		if (!checkoutCode(job, launcher, repoDir, env, listener.getLogger())) {
 			// Some error occurred, try a build now so it gets logged.
 			return new PollingResult(myBaseline, myBaseline,
 					Change.INCOMPARABLE);
@@ -619,7 +651,7 @@ public class RepoScm extends SCM implements Serializable {
 		Job<?, ?> job = build.getParent();
 		EnvVars env = build.getEnvironment(listener);
 		env = getEnvVars(env, job);
-		if (!checkoutCode(launcher, repoDir, env, listener.getLogger())) {
+		if (!checkoutCode(job, launcher, repoDir, env, listener.getLogger())) {
 			throw new IOException("Could not checkout");
 		}
 		final String manifest =
@@ -643,8 +675,8 @@ public class RepoScm extends SCM implements Serializable {
 		build.addAction(new TagAction(build));
 	}
 
-	private int doSync(final Launcher launcher, final FilePath workspace,
-			final OutputStream logger, final EnvVars env)
+	private int doSync(final Job job, final Launcher launcher, final FilePath workspace,
+			final PrintStream logger, final EnvVars env)
 		throws IOException, InterruptedException {
 		final List<String> commands = new ArrayList<String>(4);
 		debug.log(Level.FINE, "Syncing out code in: " + workspace.getName());
@@ -684,16 +716,16 @@ public class RepoScm extends SCM implements Serializable {
 			commands.add("--no-tags");
 		}
 
-		int returnCode =
-				launcher.launch().stdout(logger).pwd(workspace)
-						.cmds(commands).envs(env).join();
+		int returnCode = launchWithCredentials(commands, job, launcher,
+				workspace, env, logger);
 		return returnCode;
 	}
 
-	private boolean checkoutCode(final Launcher launcher,
+	private boolean checkoutCode(final Job job,
+			final Launcher launcher,
 			final FilePath workspace,
 			final EnvVars env,
-			final OutputStream logger)
+			final PrintStream logger)
 			throws IOException, InterruptedException {
 		final List<String> commands = new ArrayList<String>(4);
 
@@ -728,9 +760,8 @@ public class RepoScm extends SCM implements Serializable {
 		if (depth != 0) {
 			commands.add("--depth=" + depth);
 		}
-		int returnCode =
-				launcher.launch().stdout(logger).pwd(workspace)
-						.cmds(commands).envs(env).join();
+		int returnCode = launchWithCredentials(commands, job, launcher,
+				workspace, env, logger);
 		if (returnCode != 0) {
 			return false;
 		}
@@ -748,7 +779,7 @@ public class RepoScm extends SCM implements Serializable {
 			}
 		}
 
-		returnCode = doSync(launcher, workspace, logger, env);
+		returnCode = doSync(job, launcher, workspace, logger, env);
 		if (returnCode != 0) {
 			debug.log(Level.WARNING, "Sync failed. Resetting repository");
 			commands.clear();
@@ -758,7 +789,7 @@ public class RepoScm extends SCM implements Serializable {
 			commands.add("git reset --hard");
 			launcher.launch().stdout(logger).pwd(workspace).cmds(commands)
 				.envs(env).join();
-			returnCode = doSync(launcher, workspace, logger, env);
+			returnCode = doSync(job, launcher, workspace, logger, env);
 			if (returnCode != 0) {
 				return false;
 			}
@@ -839,6 +870,105 @@ public class RepoScm extends SCM implements Serializable {
 			.toString();
 	}
 
+	private void deleteTempFile(final File tempFile, final PrintStream logger) {
+		if (tempFile != null && !tempFile.delete() && tempFile.exists()) {
+			logger.println("[WARNING] temp file " + tempFile + " not deleted");
+		}
+	}
+
+	private File createSshKeyFile(final SSHUserPrivateKey sshUser)
+			throws IOException, InterruptedException {
+		File key = File.createTempFile("ssh", "key");
+		PrintWriter w = new PrintWriter(key);
+		List<String> privateKeys = sshUser.getPrivateKeys();
+		for (String s : privateKeys) {
+			w.println(s);
+		}
+		w.close();
+		new FilePath(key).chmod(0400);
+		return key;
+	}
+
+	private File createUnixGitSSH(final File key, final String user) throws IOException {
+		File ssh = File.createTempFile("ssh", ".sh");
+		PrintWriter w = new PrintWriter(ssh);
+		w.println("#!/bin/sh");
+		// ${SSH_ASKPASS} might be ignored if ${DISPLAY} is not set
+		w.println("if [ -z \"${DISPLAY}\" ]; then");
+		w.println("  DISPLAY=:123.456");
+		w.println("  export DISPLAY");
+		w.println("fi");
+		w.println("ssh -i \"" + key.getAbsolutePath() + "\" -l \"" + user
+				+ "\" -o StrictHostKeyChecking=no \"$@\"");
+		w.close();
+		ssh.setExecutable(true);
+		return ssh;
+	}
+
+	private File createUnixSshAskpass(final SSHUserPrivateKey sshUser) throws IOException {
+		File ssh = File.createTempFile("pass", ".sh");
+		PrintWriter w = new PrintWriter(ssh);
+		w.println("#!/bin/sh");
+		w.println("/bin/echo \"" + Secret.toString(sshUser.getPassphrase()) + "\"");
+		w.close();
+		ssh.setExecutable(true);
+		return ssh;
+	}
+
+	private static final CredentialsMatcher CREDENTIALS_MATCHER = CredentialsMatchers.anyOf(
+		//CredentialsMatchers.instanceOf(StandardUsernamePasswordCredentials.class),
+		CredentialsMatchers.instanceOf(SSHUserPrivateKey.class)
+		// TODO does anyone use SSL client certificates with GIT?
+	);
+
+	private StandardCredentials getCredentials(final Job job, final EnvVars env) {
+		StandardCredentials credentials = CredentialsMatchers
+			.firstOrNull(
+				CredentialsProvider.lookupCredentials(StandardCredentials.class, job,
+					ACL.SYSTEM, URIRequirementBuilder.fromUri(manifestRepositoryUrl).build()),
+				CredentialsMatchers.allOf(CredentialsMatchers.withId(credentialsId),
+					CREDENTIALS_MATCHER)
+			);
+		return credentials;
+	}
+
+	private int launchWithCredentials(final List<String> commands,
+			final Job job, final Launcher launcher, final FilePath workspace,
+			final EnvVars env, final PrintStream logger)
+			throws IOException, InterruptedException {
+		File ssh = null;
+		File key = null;
+		File pass = null;
+		try {
+			EnvVars localEnv = env;
+
+			StandardCredentials credentials = getCredentials(job, env);
+			if (credentials instanceof SSHUserPrivateKey) {
+				SSHUserPrivateKey sshUser = (SSHUserPrivateKey) credentials;
+				logger.println("using GIT_SSH to set credentials " + sshUser.getDescription());
+
+				key = createSshKeyFile(sshUser);
+				if (launcher.isUnix()) {
+					ssh =  createUnixGitSSH(key, sshUser.getUsername());
+					pass =  createUnixSshAskpass(sshUser);
+				} /*else {
+					ssh =  createWindowsGitSSH(key, sshUser.getUsername());
+					pass =  createWindowsSshAskpass(sshUser);
+				} */
+
+				localEnv = new EnvVars(env);
+				localEnv.put("GIT_SSH", ssh.getAbsolutePath());
+				localEnv.put("SSH_ASKPASS", pass.getAbsolutePath());
+			}
+			return launcher.launch().stdout(logger).pwd(workspace)
+				.stderr(logger).cmds(commands).envs(localEnv).join();
+		} finally {
+			deleteTempFile(pass, logger);
+			deleteTempFile(key, logger);
+			deleteTempFile(ssh, logger);
+		}
+	}
+
 	/**
 	 * A DescriptorImpl contains variables used server-wide. In our263 case, we
 	 * only store the path to the repo executable, which defaults to just
@@ -895,6 +1025,26 @@ public class RepoScm extends SCM implements Serializable {
 			} else {
 				return repoExecutable;
 			}
+		}
+
+		/**
+		 * Returns the list of supported credentials.
+		 * @param project The project
+		 * @param url The URL
+		 */
+		public ListBoxModel doFillCredentialsIdItems(@AncestorInPath final Item project,
+													 @QueryParameter final String url) {
+			if (project == null || !project.hasPermission(Item.CONFIGURE)) {
+				return new StandardListBoxModel();
+			}
+			return new StandardListBoxModel()
+				.withEmptySelection()
+				.withMatching(
+					CREDENTIALS_MATCHER,
+					CredentialsProvider.lookupCredentials(StandardCredentials.class,
+						project, ACL.SYSTEM,
+						URIRequirementBuilder.fromUri(url).build())
+				);
 		}
 
 		@Override

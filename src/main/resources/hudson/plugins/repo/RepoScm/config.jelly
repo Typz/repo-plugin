@@ -4,7 +4,8 @@
 	xmlns:d="jelly:define"
 	xmlns:l="/lib/layout"
 	xmlns:t="/lib/hudson"
-	xmlns:f="/lib/form">
+	xmlns:f="/lib/form"
+	xmlns:c="/lib/credentials">
 
 	<f:entry title="Manifest Repository Url" help="/plugin/repo/help-manifestRepositoryUrl.html">
 		<f:textbox name="repo.manifestRepositoryUrl" value="${scm.manifestRepositoryUrl}" />
@@ -75,6 +76,10 @@
 		<f:entry title="Local Manifest" help="/plugin/repo/help-localManifest.html">
 			<f:textarea name="repo.localManifest" value="${scm.localManifest}" rows="10" />
 		</f:entry>
+
+        <f:entry title="Credentials" help="/plugin/repo/help-credentials.html" field="credentialsId">
+            <c:select/>
+        </f:entry>
 
 	</f:advanced>
 </j:jelly>
